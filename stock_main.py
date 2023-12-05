@@ -4,6 +4,8 @@ import pandas as pd
 import pytz
 import sys
 import logging
+import configparser
+
 
 from alpaca.data.live import StockDataStream
 from alpaca.trading.client import TradingClient
@@ -16,9 +18,11 @@ from alpaca.trading.requests import LimitOrderRequest, OrderRequest, MarketOrder
 
 logger = logging.getLogger()
 
+config = configparser.ConfigParser()
+config.read("config.ini")
 
-ALPACA_API_KEY = ""
-ALPACA_SECRET_KEY = ""
+ALPACA_API_KEY = config['ALPACA_KEYS']['API_KEY']
+ALPACA_SECRET_KEY = config['ALPACA_KEYS']['SECRET_KEY']
 
 
 class ScalpAlgo:
@@ -104,21 +108,16 @@ class ScalpAlgo:
             self._cancel_order()
 
         if self._position is not None and self._outofmarket():
-            self._cancel_order()
-            # this places a new sell order that will trigger on_order_update
-            # once the sell is filled on_order_update runs as if something was bought and places a sell order again, shorting the asset
-            # might be caused be init_state in _cancel_order
+            # self._cancel_order()
+            # going to try not canceling order first, but i believe that causes an error
             self._submit_sell(bailout=True)
 
     def _cancel_order(self):
         if self._order is not None:
             self._api.cancel_order_by_id(self._order.id)
-            # self._init_state()
 
     def _calc_buy_signal(self):
         mavg = self._bars.rolling(20).mean().close.values
-        change = (self._bars.iloc[-20:].pct_change(fill_method=None) > 0).close.values
-        change_pct = change.sum()/len(change)
         closes = self._bars.close.values
         if closes[-2] < mavg[-2] and closes[-1] > mavg[-1]:
             self._l.info(
@@ -127,7 +126,7 @@ class ScalpAlgo:
             return True
         else:
             self._l.debug(
-                f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}, {change_pct=}')
+                f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}')
             return False
 
     def on_bar(self, bar):

@@ -20,19 +20,14 @@ This script needs latest [Alpaca Python SDK](https://github.com/alpacahq/alpaca-
 Please install it using pip
 
 ```sh
-$ pip3 install alpaca-trade-api
+$ pip3 install -r requirements.txt
 ```
 
-or use [pipenv](https://github.com/pypa/pipenv) using `Pipfile` in this directory.
-
-```sh
-$ pipenv install
-```
 
 ## Usage
 
 ```sh
-$ python main.py --lot=2000 TSLA FB AAPL
+$ python stock_main.py
 ```
 
 You can specify as many symbols as you want.  The script is designed to kick off while market

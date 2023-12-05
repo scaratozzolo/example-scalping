@@ -9,3 +9,4 @@ __pycache__
 algo-state.pkl
 /data
 console.log
+config.ini
