@@ -1,51 +1,68 @@
-import alpaca_trade_api as alpaca
+from datetime import datetime
 import asyncio
 import pandas as pd
 import pytz
 import sys
 import logging
 
-from alpaca_trade_api import Stream
-from alpaca_trade_api.common import URL
-from alpaca_trade_api.rest import TimeFrame
+from alpaca.data.live import StockDataStream
+from alpaca.trading.client import TradingClient
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest, StockLatestBarRequest
+from alpaca.trading.stream import TradingStream
+from alpaca.data.enums import DataFeed
+from alpaca.trading.requests import LimitOrderRequest, OrderRequest, MarketOrderRequest
 
 logger = logging.getLogger()
 
-ALPACA_API_KEY = "<key_id>"
-ALPACA_SECRET_KEY = "<secret_key>"
+
+ALPACA_API_KEY = ""
+ALPACA_SECRET_KEY = ""
 
 
 class ScalpAlgo:
-    def __init__(self, api, symbol, lot):
+    def __init__(self, api, hist_data_api, symbol, lot):
         self._api = api
+        self._hist_data_api = hist_data_api
         self._symbol = symbol
         self._lot = lot
         self._bars = []
         self._l = logger.getChild(self._symbol)
+        # self._l = logger.bind(symbol=self._symbol)
 
         now = pd.Timestamp.now(tz='America/New_York').floor('1min')
         market_open = now.replace(hour=9, minute=30)
-        today = now.strftime('%Y-%m-%d')
-        tomorrow = (now + pd.Timedelta('1day')).strftime('%Y-%m-%d')
         while 1:
             # at inception this results sometimes in api errors. this will work
             # around it. feel free to remove it once everything is stable
             try:
-                data = api.get_bars(symbol, TimeFrame.Minute, today, tomorrow,
-                                    adjustment='raw').df
+                bars_request = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    start=market_open,
+                    end=now,
+                    timeframe=TimeFrame.Minute,
+                    adjustment='raw',
+                    feed=DataFeed.IEX,
+                )
+                data = hist_data_api.get_stock_bars(bars_request).df
+
+                bars=data
                 break
-            except:
+            except Exception as e:
                 # make sure we get bars
+                self._l.error(f"data failed: {e}")
                 pass
-        bars = data[market_open:]
+            
+
         self._bars = bars
 
         self._init_state()
 
     def _init_state(self):
         symbol = self._symbol
-        order = [o for o in self._api.list_orders() if o.symbol == symbol]
-        position = [p for p in self._api.list_positions()
+        order = [o for o in self._api.get_orders() if o.symbol == symbol]
+        position = [p for p in self._api.get_all_positions()
                     if p.symbol == symbol]
         self._order = order[0] if len(order) > 0 else None
         self._position = position[0] if len(position) > 0 else None
@@ -79,41 +96,48 @@ class ScalpAlgo:
         order = self._order
         if (order is not None and
             order.side == 'buy' and now -
-                order.submitted_at.tz_convert(tz='America/New_York') > pd.Timedelta('2 min')):
-            last_price = self._api.get_last_trade(self._symbol).price
+                pd.Timestamp(order.submitted_at).tz_convert(tz='America/New_York') > pd.Timedelta('2 min')):
+            last_price = self._get_last_trade().price
             self._l.info(
                 f'canceling missed buy order {order.id} at {order.limit_price} '
                 f'(current price = {last_price})')
             self._cancel_order()
 
         if self._position is not None and self._outofmarket():
+            self._cancel_order()
+            # this places a new sell order that will trigger on_order_update
+            # once the sell is filled on_order_update runs as if something was bought and places a sell order again, shorting the asset
+            # might be caused be init_state in _cancel_order
             self._submit_sell(bailout=True)
 
     def _cancel_order(self):
         if self._order is not None:
-            self._api.cancel_order(self._order.id)
+            self._api.cancel_order_by_id(self._order.id)
+            # self._init_state()
 
     def _calc_buy_signal(self):
         mavg = self._bars.rolling(20).mean().close.values
+        change = (self._bars.iloc[-20:].pct_change(fill_method=None) > 0).close.values
+        change_pct = change.sum()/len(change)
         closes = self._bars.close.values
         if closes[-2] < mavg[-2] and closes[-1] > mavg[-1]:
             self._l.info(
                 f'buy signal: closes[-2] {closes[-2]} < mavg[-2] {mavg[-2]} '
-                f'closes[-1] {closes[-1]} > mavg[-1] {mavg[-1]}')
+                f'closes[-1] {closes[-1]} > mavg[-1] {mavg[-1]} ')
             return True
         else:
-            self._l.info(
-                f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}')
+            self._l.debug(
+                f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}, {change_pct=}')
             return False
 
     def on_bar(self, bar):
-        self._bars = self._bars.append(pd.DataFrame({
+        self._bars = pd.concat([self._bars, pd.DataFrame({
             'open': bar.open,
             'high': bar.high,
             'low': bar.low,
             'close': bar.close,
             'volume': bar.volume,
-        }, index=[pd.Timestamp(bar.timestamp, tz=pytz.UTC)]))
+        }, index=[pd.Timestamp(bar.timestamp).tz_convert(pytz.UTC)])])
 
         self._l.info(
             f'received bar start: {pd.Timestamp(bar.timestamp)}, close: {bar.close}, len(bars): {len(self._bars)}')
@@ -131,7 +155,7 @@ class ScalpAlgo:
         if event == 'fill':
             self._order = None
             if self._state == 'BUY_SUBMITTED':
-                self._position = self._api.get_position(self._symbol)
+                self._position = self._api.get_open_position(self._symbol)
                 self._transition('TO_SELL')
                 self._submit_sell()
                 return
@@ -140,8 +164,8 @@ class ScalpAlgo:
                 self._transition('TO_BUY')
                 return
         elif event == 'partial_fill':
-            self._position = self._api.get_position(self._symbol)
-            self._order = self._api.get_order(order['id'])
+            self._position = self._api.get_open_position(self._symbol)
+            self._order = self._api.get_order_by_id(order.id)
             return
         elif event in ('canceled', 'rejected'):
             if event == 'rejected':
@@ -160,19 +184,21 @@ class ScalpAlgo:
                 self._l.warn(f'unexpected state for {event}: {self._state}')
 
     def _submit_buy(self):
-        trade = self._api.get_last_trade(self._symbol)
+        trade = self._get_last_trade()
+        # self._l.info(f"last trade: {trade=}")
         amount = int(self._lot / trade.price)
         try:
-            order = self._api.submit_order(
+            order_request = LimitOrderRequest(
                 symbol=self._symbol,
                 side='buy',
                 type='limit',
                 qty=amount,
                 time_in_force='day',
-                limit_price=trade.price,
+                limit_price=round(trade.price,2),
             )
+            order = self._api.submit_order(order_request)
         except Exception as e:
-            self._l.info(e)
+            self._l.error(e)
             self._transition('TO_BUY')
             return
 
@@ -181,6 +207,7 @@ class ScalpAlgo:
         self._transition('BUY_SUBMITTED')
 
     def _submit_sell(self, bailout=False):
+        order_class = OrderRequest
         params = dict(
             symbol=self._symbol,
             side='sell',
@@ -189,18 +216,21 @@ class ScalpAlgo:
         )
         if bailout:
             params['type'] = 'market'
+            order_class = MarketOrderRequest
         else:
             current_price = float(
-                self._api.get_last_trade(
-                    self._symbol).price)
+                self._get_last_trade().price)
             cost_basis = float(self._position.avg_entry_price)
-            limit_price = max(cost_basis + 0.01, current_price)
+            limit_price = round(max(cost_basis + 0.01, current_price),2)
             params.update(dict(
                 type='limit',
                 limit_price=limit_price,
             ))
+            order_class = LimitOrderRequest
+
         try:
-            order = self._api.submit_order(**params)
+            order_request = order_class(**params)
+            order = self._api.submit_order(order_request)
         except Exception as e:
             self._l.error(e)
             self._transition('TO_SELL')
@@ -214,21 +244,71 @@ class ScalpAlgo:
         self._l.info(f'transition from {self._state} to {new_state}')
         self._state = new_state
 
+    def _get_last_trade(self):
+
+        return self._hist_data_api.get_stock_latest_trade(
+            StockLatestTradeRequest(
+                symbol_or_symbols=self._symbol,
+            )
+        )[self._symbol]
+
+
+def add_to_fleet(data):
+    change = (data.iloc[-1]['close']/data.iloc[0]['close'])-1
+    return change > 0
+
+
 
 def main(args):
-    stream = Stream(ALPACA_API_KEY,
-                    ALPACA_SECRET_KEY,
-                    base_url=URL('https://paper-api.alpaca.markets'),
-                    data_feed='iex')  # <- replace to sip for PRO subscription
-    api = alpaca.REST(key_id=ALPACA_API_KEY,
-                    secret_key=ALPACA_SECRET_KEY,
-                    base_url="https://paper-api.alpaca.markets")
+
+    stream = StockDataStream(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+    )
+    logger.info("stock stream created")
+
+    api = TradingClient(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+        paper=True,
+    )
+    logger.info("trading client created")
+
+    hist_stock_api = StockHistoricalDataClient(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+    )
+    logger.info(f"historical data client created")
+
+    trading_stream = TradingStream(
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+        paper=True,
+    )
+    logger.info(f"trading stream client created")
+
 
     fleet = {}
     symbols = args.symbols
+
+    end = pd.Timestamp.now(tz='America/New_York').floor('1min')
+    start = end - pd.Timedelta("7 days")
+    bars_request = StockBarsRequest(
+        symbol_or_symbols=args.symbols,
+        start=start,
+        end=end,
+        timeframe=TimeFrame.Minute,
+        adjustment='raw',
+        feed=DataFeed.IEX,
+    )
+    week_data = hist_stock_api.get_stock_bars(bars_request).df
+
     for symbol in symbols:
-        algo = ScalpAlgo(api, symbol, lot=args.lot)
-        fleet[symbol] = algo
+        if add_to_fleet(week_data.loc[symbol]):
+            logger.debug(f"{symbol} added to fleet")
+            algo = ScalpAlgo(api, hist_stock_api, symbol, lot=2000)
+            fleet[symbol] = algo
+    logger.info(f"fleet initialized: {len(fleet)}")
 
     async def on_bars(data):
         if data.symbol in fleet:
@@ -236,14 +316,16 @@ def main(args):
 
     for symbol in symbols:
         stream.subscribe_bars(on_bars, symbol)
+    logger.info("fleet subscribed")
 
     async def on_trade_updates(data):
-        logger.info(f'trade_updates {data}')
-        symbol = data.order['symbol']
+        logger.debug(f'trade_updates {data}')
+        symbol = data.order.symbol
         if symbol in fleet:
             fleet[symbol].on_order_update(data.event, data.order)
 
-    stream.subscribe_trade_updates(on_trade_updates)
+    
+    trading_stream.subscribe_trade_updates(on_trade_updates)
 
     async def periodic():
         while True:
@@ -251,31 +333,39 @@ def main(args):
                 logger.info('exit as market is not open')
                 sys.exit(0)
             await asyncio.sleep(30)
-            positions = api.list_positions()
+            positions = api.get_all_positions()
             for symbol, algo in fleet.items():
                 pos = [p for p in positions if p.symbol == symbol]
                 algo.checkup(pos[0] if len(pos) > 0 else None)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(asyncio.gather(
         stream._run_forever(),
         periodic(),
+        trading_stream._run_forever(),
     ))
     loop.close()
+
 
 
 if __name__ == '__main__':
     import argparse
 
-    fmt = '%(asctime)s:%(filename)s:%(lineno)d:%(levelname)s:%(name)s:%(message)s'
+    fmt = '%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(name)s | %(message)s'
     logging.basicConfig(level=logging.INFO, format=fmt)
     fh = logging.FileHandler('console.log')
-    fh.setLevel(logging.INFO)
+    fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt))
     logger.addHandler(fh)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('symbols', nargs='+')
-    parser.add_argument('--lot', type=float, default=2000)
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument('symbols', nargs='+')
+    # parser.add_argument('--lot', type=float, default=2000)
 
-    main(parser.parse_args())
+    class parser:
+        lot = 2000
+        with open("watchlist.txt", "r") as f:
+            symbols = [i.strip() for i in f.readlines()]
+
+    main(parser)
