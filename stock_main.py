@@ -5,6 +5,7 @@ import pytz
 import sys
 import logging
 import configparser
+import pathlib
 
 
 from alpaca.data.live import StockDataStream
@@ -16,7 +17,21 @@ from alpaca.trading.stream import TradingStream
 from alpaca.data.enums import DataFeed
 from alpaca.trading.requests import LimitOrderRequest, OrderRequest, MarketOrderRequest
 
+now = pd.Timestamp.now(tz='America/New_York').floor('1min')
+market_open = now.replace(hour=9, minute=30)
+today = now.strftime('%Y-%m-%d')
+
+logs_path = pathlib.Path(f'logs/{today}')
+logs_path.mkdir(parents=True, exist_ok=True)
+
 logger = logging.getLogger()
+
+fmt = '%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(name)s | %(message)s'
+logging.basicConfig(level=logging.INFO, format=fmt)
+fh = logging.FileHandler(logs_path / 'console.log')
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter(fmt))
+logger.addHandler(fh)
 
 config = configparser.ConfigParser()
 config.read("config.ini")
@@ -33,10 +48,11 @@ class ScalpAlgo:
         self._lot = lot
         self._bars = []
         self._l = logger.getChild(self._symbol)
-        # self._l = logger.bind(symbol=self._symbol)
 
-        now = pd.Timestamp.now(tz='America/New_York').floor('1min')
-        market_open = now.replace(hour=9, minute=30)
+        fh = logging.FileHandler(logs_path / f'{self._symbol}.log')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(fmt))
+        self._l.addHandler(fh)
         while 1:
             # at inception this results sometimes in api errors. this will work
             # around it. feel free to remove it once everything is stable
@@ -108,25 +124,40 @@ class ScalpAlgo:
             self._cancel_order()
 
         if self._position is not None and self._outofmarket():
-            # self._cancel_order()
-            # going to try not canceling order first, but i believe that causes an error
-            self._submit_sell(bailout=True)
+            self._l.debug(f"{self._position=} {self._order=}")
+            self._cancel_order()
+            # dont need to submit sell because on order update should handle the order canceled event
+            # self._submit_sell(bailout=True)
 
     def _cancel_order(self):
         if self._order is not None:
+            self._l.debug(f"canceling order {self._order}")
             self._api.cancel_order_by_id(self._order.id)
 
     def _calc_buy_signal(self):
-        mavg = self._bars.rolling(20).mean().close.values
-        closes = self._bars.close.values
-        if closes[-2] < mavg[-2] and closes[-1] > mavg[-1]:
-            self._l.info(
-                f'buy signal: closes[-2] {closes[-2]} < mavg[-2] {mavg[-2]} '
-                f'closes[-1] {closes[-1]} > mavg[-1] {mavg[-1]} ')
+        # mavg = self._bars.rolling(15).mean().close.values
+        # closes = self._bars.close.values
+        # if closes[-2] < mavg[-2] and closes[-1] > mavg[-1]:
+        #     self._l.info(
+        #         f'buy signal: closes[-2] {closes[-2]} < mavg[-2] {mavg[-2]} '
+        #         f'closes[-1] {closes[-1]} > mavg[-1] {mavg[-1]} ')
+        #     return True
+        # else:
+        #     self._l.debug(
+        #         f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}')
+        #     return False
+
+        bars = self._bars.close.values
+        momfast = (bars[-1] - bars[-2]) > 0
+        mommed = (bars[-1] - bars[-6]) > 0
+        momslow = (bars[-1] - bars[-12]) > 0
+
+        self._l.debug(f"{bars[-1]=}, {bars[-2]=}, {bars[-6]=}, {bars[-12]=}")
+
+        if momfast and mommed and momslow:
+            self._l.info(f"buy signal: {momfast=} and {mommed=} and {momslow=}")
             return True
         else:
-            self._l.debug(
-                f'closes[-2:] = {closes[-2:]}, mavg[-2:] = {mavg[-2:]}')
             return False
 
     def on_bar(self, bar):
@@ -150,11 +181,21 @@ class ScalpAlgo:
                 self._submit_buy()
 
     def on_order_update(self, event, order):
+
+        self._l.debug(f"{event=}, {order=}")
+        
+        # if self._outofmarket():
+        #     # dont do anything if the day is over
+        #     # this should hopefully prevent the accidental short selling that occurs when trying to liquidate at the end of the day
+        #     self._l.info("out of market, nothing to do")
+        #     return
+        
         self._l.info(f'order update: {event} = {order}')
         if event == 'fill':
             self._order = None
             if self._state == 'BUY_SUBMITTED':
                 self._position = self._api.get_open_position(self._symbol)
+                self._l.debug(f"buy filled, {self._position=}")
                 self._transition('TO_SELL')
                 self._submit_sell()
                 return
@@ -165,6 +206,7 @@ class ScalpAlgo:
         elif event == 'partial_fill':
             self._position = self._api.get_open_position(self._symbol)
             self._order = self._api.get_order_by_id(order.id)
+            self._l.debug(f"partial fill, {self._position}")
             return
         elif event in ('canceled', 'rejected'):
             if event == 'rejected':
@@ -172,11 +214,14 @@ class ScalpAlgo:
             self._order = None
             if self._state == 'BUY_SUBMITTED':
                 if self._position is not None:
+                    self._l.debug("buy order canceled, submit sell")
                     self._transition('TO_SELL')
                     self._submit_sell()
                 else:
+                    self._l.debug("order canceled, no position")
                     self._transition('TO_BUY')
             elif self._state == 'SELL_SUBMITTED':
+                self._l.debug(f"sell order canceled, submit bailout sell, {self._position=}")
                 self._transition('TO_SELL')
                 self._submit_sell(bailout=True)
             else:
@@ -351,12 +396,7 @@ def main(args):
 if __name__ == '__main__':
     import argparse
 
-    fmt = '%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(name)s | %(message)s'
-    logging.basicConfig(level=logging.INFO, format=fmt)
-    fh = logging.FileHandler('console.log')
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(fmt))
-    logger.addHandler(fh)
+    
 
     # parser = argparse.ArgumentParser()
     # parser.add_argument('symbols', nargs='+')

@@ -8,5 +8,5 @@ __pycache__
 .pytest_cache
 algo-state.pkl
 /data
-console.log
+**/*.log
 config.ini
